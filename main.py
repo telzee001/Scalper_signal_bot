@@ -4,17 +4,14 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from threading import Thread
+from flask import Flask
 
-# ==================== CONFIGURATION ====================
-# Read sensitive data from environment variables (set these in your hosting platform)
+# ==================== TELEGRAM CONFIG ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# If you prefer to hardcode (only for testing), replace the lines above with:
-# TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
-# CHAT_ID = "YOUR_CHAT_ID"
-
-# List of symbols (USDT pairs for crypto, standard forex pairs)
+# ==================== SYMBOLS & PARAMETERS ====================
 CRYPTO_SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT',
     'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT',
@@ -25,13 +22,10 @@ FOREX_SYMBOLS = [
     'USDCAD', 'USDCHF', 'NZDUSD', 'EURGBP',
     'EURJPY', 'GBPJPY'
 ]
+CRYPTO_TIMEFRAME = '1m'
+FOREX_TIMEFRAME   = '5m'
+LOOKBACK = 150
 
-# Timeframes
-CRYPTO_TIMEFRAME = '1m'      # 1 minute
-FOREX_TIMEFRAME   = '5m'      # 5 minutes
-LOOKBACK = 150                # number of candles
-
-# Scalping indicator parameters
 SUPERTREND_PERIOD = 7
 SUPERTREND_MULTIPLIER = 2.0
 RSI_PERIOD = 7
@@ -43,28 +37,21 @@ STOCH_K_PERIOD = 7
 STOCH_D_PERIOD = 3
 EMA_FAST = 5
 EMA_SLOW = 10
-
-# Risk / Reward (scalping)
 ATR_PERIOD = 7
-RR_RATIO = 1.5   # TP = entry ± RR * ATR, SL = entry ± ATR
+RR_RATIO = 1.5
 
-# ==================== TELEGRAM ====================
+# ==================== TELEGRAM HELPER ====================
 def send_telegram(message):
-    """Send a message to your Telegram chat via bot."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("ERROR: TELEGRAM_TOKEN or CHAT_ID not set")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        response = requests.post(url, json={"chat_id": CHAT_ID, "text": message})
-        if response.status_code != 200:
-            print(f"Telegram send error: {response.status_code} {response.text}")
+        requests.post(url, json={"chat_id": CHAT_ID, "text": message})
     except Exception as e:
-        print(f"Telegram exception: {e}")
+        print(f"Telegram error: {e}")
 
 # ==================== DATA FETCHERS ====================
 def fetch_crypto_ohlcv(symbol, interval='1m', limit=150):
-    """Get OHLCV from Binance."""
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     try:
         r = requests.get(url)
@@ -79,37 +66,29 @@ def fetch_crypto_ohlcv(symbol, interval='1m', limit=150):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        print(f"Crypto fetch error {symbol}: {e}")
+        print(f"Crypto error {symbol}: {e}")
         return None
 
 def fetch_forex_ohlcv(symbol, interval='5m', limit=150):
-    """Get OHLCV from Yahoo Finance."""
     import yfinance as yf
     ticker = yf.Ticker(f"{symbol}=X")
-    # Yahoo interval can be '1m', '2m', '5m', '15m', etc.
     df = ticker.history(period=f"{limit*2}m", interval=interval)
     if df.empty:
         return None
     df = df.reset_index()
     df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-    df = df.tail(limit)
-    return df
+    return df.tail(limit)
 
 # ==================== INDICATORS ====================
 def calculate_supertrend(df, period, multiplier):
     high = df['high']
     low = df['low']
     close = df['close']
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     atr = tr.rolling(window=period).mean()
     hl_avg = (high + low) / 2
     upper_band = hl_avg + multiplier * atr
     lower_band = hl_avg - multiplier * atr
-    # Determine direction (vectorised with forward fill)
     supertrend_dir = np.where(close > upper_band, 1, -1)
     for i in range(1, len(supertrend_dir)):
         if close.iloc[i] > upper_band.iloc[i]:
@@ -133,8 +112,7 @@ def calculate_rsi(df, period):
     avg_gain = gain.rolling(window=period).mean()
     avg_loss = loss.rolling(window=period).mean()
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 def calculate_adx(df, period):
     high = df['high']
@@ -149,8 +127,7 @@ def calculate_adx(df, period):
     plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
     minus_di = 100 * (minus_dm.abs().rolling(window=period).mean() / atr)
     dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-    adx = dx.rolling(window=period).mean()
-    return adx
+    return dx.rolling(window=period).mean()
 
 def calculate_stochastic(df, k_period, d_period):
     low_min = df['low'].rolling(window=k_period).min()
@@ -160,20 +137,12 @@ def calculate_stochastic(df, k_period, d_period):
     return stoch_k, stoch_d
 
 def calculate_atr(df, period):
-    tr = pd.concat([
-        df['high'] - df['low'],
-        (df['high'] - df['close'].shift()).abs(),
-        (df['low'] - df['close'].shift()).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
 
-# ==================== SIGNAL GENERATION ====================
 def check_signal(asset_name, df, is_crypto, current_price=None):
-    """Return signal dict or None."""
     if df is None or len(df) < LOOKBACK:
         return None
-
-    # Add all indicators
     df = calculate_supertrend(df, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
     df['ema_fast'] = calculate_ema(df, EMA_FAST)
     df['ema_slow'] = calculate_ema(df, EMA_SLOW)
@@ -185,10 +154,8 @@ def check_signal(asset_name, df, is_crypto, current_price=None):
 
     last = df.iloc[-1]
     close = last['close']
-    if current_price is None:
-        current_price = close
+    current_price = current_price or close
 
-    # Long conditions
     long_cond = (
         (last['supertrend_dir'] == 1) &
         (last['adx'] > ADX_THRESHOLD) &
@@ -197,8 +164,6 @@ def check_signal(asset_name, df, is_crypto, current_price=None):
         (last['stoch_k'] < 20) & (last['stoch_k'] > last['stoch_d']) &
         (last['volume'] > last['volume_sma'] * VOLUME_SPIKE)
     )
-
-    # Short conditions
     short_cond = (
         (last['supertrend_dir'] == -1) &
         (last['adx'] > ADX_THRESHOLD) &
@@ -220,8 +185,7 @@ def check_signal(asset_name, df, is_crypto, current_price=None):
             msg = f"{asset_name} Long\nentry:{entry:.2f}\nTp:{tp:.2f}\nSL:{sl:.2f}"
         else:
             msg = f"{asset_name} Buy\nentry:{entry:.5f}\nTp:{tp:.5f}\nSL:{sl:.5f}"
-        return {'type': 'buy', 'message': msg}
-
+        return {'message': msg}
     elif short_cond:
         entry = current_price
         sl = entry + atr
@@ -230,18 +194,15 @@ def check_signal(asset_name, df, is_crypto, current_price=None):
             msg = f"{asset_name} Short\nentry:{entry:.2f}\nTp:{tp:.2f}\nSL:{sl:.2f}"
         else:
             msg = f"{asset_name} Sell\nentry:{entry:.5f}\nTp:{tp:.5f}\nSL:{sl:.5f}"
-        return {'type': 'sell', 'message': msg}
-
+        return {'message': msg}
     return None
 
-# ==================== MAIN LOOP ====================
-def main():
-    print("🚀 SCALPER SIGNAL BOT STARTED")
+# ==================== BOT THREAD ====================
+def bot_worker():
     send_telegram("⚡ Scalper Signal Bot is live! Scanning for high‑probability setups (70%+ win rate).")
-
     while True:
         try:
-            # Crypto (1‑minute)
+            # Crypto
             for sym in CRYPTO_SYMBOLS:
                 df = fetch_crypto_ohlcv(sym, CRYPTO_TIMEFRAME, LOOKBACK)
                 if df is not None:
@@ -249,23 +210,36 @@ def main():
                     signal = check_signal(asset_name, df, is_crypto=True)
                     if signal:
                         send_telegram(signal['message'])
-                        print(f"[{datetime.now()}] Crypto scalp signal for {sym}")
-
-            # Forex (5‑minute)
+                        print(f"[{datetime.now()}] Crypto signal {sym}")
+            # Forex
             for sym in FOREX_SYMBOLS:
                 df = fetch_forex_ohlcv(sym, FOREX_TIMEFRAME, LOOKBACK)
                 if df is not None:
                     signal = check_signal(sym, df, is_crypto=False)
                     if signal:
                         send_telegram(signal['message'])
-                        print(f"[{datetime.now()}] Forex scalp signal for {sym}")
-
-            print(f"[{datetime.now()}] Scalp scan complete. Waiting 60 seconds...")
-            time.sleep(60)  # scan every minute for crypto 1m
-
+                        print(f"[{datetime.now()}] Forex signal {sym}")
+            time.sleep(60)
         except Exception as e:
-            print(f"Error in main loop: {e}")
+            print(f"Worker error: {e}")
             time.sleep(30)
 
-if __name__ == "__main__":
-    main()
+# ==================== FLASK APP (for Pxxl WSGI) ====================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Scalper Signal Bot is running!"
+
+@app.route('/health')
+def health():
+    return "OK"
+
+# Start the bot thread when the Flask app starts
+thread = Thread(target=bot_worker, daemon=True)
+thread.start()
+
+# For local testing you can run with: python main.py
+# For Gunicorn, just the app object is enough.
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8000)
