@@ -1,15 +1,20 @@
+import os
 import time
 import requests
 import pandas as pd
 import numpy as np
-import os
 from datetime import datetime
 
 # ==================== CONFIGURATION ====================
-TELEGRAM_TOKEN = "8664443363:AAHYshB09vduIHvxCbUWzRpC7te10j4FX-s"      # <-- replace
-CHAT_ID = "7082788269"               # <-- replace
+# Read sensitive data from environment variables (set these in your hosting platform)
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
-# Symbols
+# If you prefer to hardcode (only for testing), replace the lines above with:
+# TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
+# CHAT_ID = "YOUR_CHAT_ID"
+
+# List of symbols (USDT pairs for crypto, standard forex pairs)
 CRYPTO_SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT',
     'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT',
@@ -22,9 +27,9 @@ FOREX_SYMBOLS = [
 ]
 
 # Timeframes
-CRYPTO_TIMEFRAME = '1m'     # 1 minute
-FOREX_TIMEFRAME = '5m'      # 5 minutes
-LOOKBACK = 150
+CRYPTO_TIMEFRAME = '1m'      # 1 minute
+FOREX_TIMEFRAME   = '5m'      # 5 minutes
+LOOKBACK = 150                # number of candles
 
 # Scalping indicator parameters
 SUPERTREND_PERIOD = 7
@@ -39,20 +44,27 @@ STOCH_D_PERIOD = 3
 EMA_FAST = 5
 EMA_SLOW = 10
 
-# Risk / Reward
+# Risk / Reward (scalping)
 ATR_PERIOD = 7
 RR_RATIO = 1.5   # TP = entry ± RR * ATR, SL = entry ± ATR
 
 # ==================== TELEGRAM ====================
 def send_telegram(message):
+    """Send a message to your Telegram chat via bot."""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("ERROR: TELEGRAM_TOKEN or CHAT_ID not set")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": message})
+        response = requests.post(url, json={"chat_id": CHAT_ID, "text": message})
+        if response.status_code != 200:
+            print(f"Telegram send error: {response.status_code} {response.text}")
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        print(f"Telegram exception: {e}")
 
 # ==================== DATA FETCHERS ====================
 def fetch_crypto_ohlcv(symbol, interval='1m', limit=150):
+    """Get OHLCV from Binance."""
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     try:
         r = requests.get(url)
@@ -71,9 +83,10 @@ def fetch_crypto_ohlcv(symbol, interval='1m', limit=150):
         return None
 
 def fetch_forex_ohlcv(symbol, interval='5m', limit=150):
+    """Get OHLCV from Yahoo Finance."""
     import yfinance as yf
     ticker = yf.Ticker(f"{symbol}=X")
-    # Yahoo Finance: interval can be '1m', '2m', '5m', '15m', etc.
+    # Yahoo interval can be '1m', '2m', '5m', '15m', etc.
     df = ticker.history(period=f"{limit*2}m", interval=interval)
     if df.empty:
         return None
@@ -96,7 +109,7 @@ def calculate_supertrend(df, period, multiplier):
     hl_avg = (high + low) / 2
     upper_band = hl_avg + multiplier * atr
     lower_band = hl_avg - multiplier * atr
-    # Direction
+    # Determine direction (vectorised with forward fill)
     supertrend_dir = np.where(close > upper_band, 1, -1)
     for i in range(1, len(supertrend_dir)):
         if close.iloc[i] > upper_band.iloc[i]:
@@ -154,12 +167,13 @@ def calculate_atr(df, period):
     ], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
 
-# ==================== SIGNAL LOGIC ====================
+# ==================== SIGNAL GENERATION ====================
 def check_signal(asset_name, df, is_crypto, current_price=None):
+    """Return signal dict or None."""
     if df is None or len(df) < LOOKBACK:
         return None
 
-    # Calculate indicators
+    # Add all indicators
     df = calculate_supertrend(df, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
     df['ema_fast'] = calculate_ema(df, EMA_FAST)
     df['ema_slow'] = calculate_ema(df, EMA_SLOW)
@@ -174,7 +188,7 @@ def check_signal(asset_name, df, is_crypto, current_price=None):
     if current_price is None:
         current_price = close
 
-    # Long conditions (scalping)
+    # Long conditions
     long_cond = (
         (last['supertrend_dir'] == 1) &
         (last['adx'] > ADX_THRESHOLD) &
